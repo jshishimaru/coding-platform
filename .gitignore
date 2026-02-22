@@ -13,6 +13,9 @@
 *.log
 logs/
 
+src/backend/
+src/frontend/
+
 # Docker
 docker-compose.override.yml
 
