@@ -19,6 +19,7 @@ export POSTGRES_PORT=5433
 export REDIS_PORT=6380
 export BACKEND_PORT=3000
 export FRONTEND_PORT=8080
+export ADMIN_PORT=8081
 
 # Fix permissions on data directories
 echo "🔧 Fixing data directory permissions..."
@@ -66,17 +67,27 @@ else
     echo "⚠️  $container_status"
 fi
 
+# Check admin frontend
+echo -n "  Admin Frontend: "
+container_status=$(docker inspect --format='{{.State.Status}}' coding-platform-admin 2>/dev/null || echo "not found")
+if [ "$container_status" = "running" ]; then
+    echo "✅ running"
+else
+    echo "⚠️  $container_status"
+fi
+
 echo ""
 echo "================================================"
 echo "✅ Services Started!"
 echo ""
 echo "📊 Access Points:"
 echo "  - Frontend:     http://localhost:$FRONTEND_PORT"
+echo "  - Admin Portal:  http://localhost:$ADMIN_PORT"
 echo "  - Backend API:  http://localhost:$BACKEND_PORT/api/health"
 echo "  - PostgreSQL:   localhost:$POSTGRES_PORT"
 echo "  - Redis:        localhost:$REDIS_PORT"
 echo ""
-echo "📋 Useful commands:"
+echo " Useful commands:"
 echo "  - View all containers:  docker ps"
 echo "  - View logs:            docker compose logs -f"
 echo "  - View service logs:    docker compose logs -f <service>"

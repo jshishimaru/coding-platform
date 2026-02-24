@@ -15,6 +15,7 @@ logs/
 
 src/backend/
 src/frontend/
+src/admin-frontend/
 
 # Docker
 docker-compose.override.yml

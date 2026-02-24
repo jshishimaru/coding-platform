@@ -190,3 +190,170 @@ INSERT INTO app.tags (name) VALUES
     ('Linked List'), ('Two Pointers'), ('Sliding Window'), ('Stack'), ('Queue'),
     ('Recursion'), ('Backtracking'), ('Bit Manipulation'), ('Heap'), ('Trie')
 ON CONFLICT (name) DO NOTHING;
+
+
+-- ============================================================
+-- ADMIN PORTAL TABLES
+-- ============================================================
+
+-- Add permissions column to users (fine-grained RBAC overrides)
+ALTER TABLE app.users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- Extend contests with scoring configuration and lifecycle state
+ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS scoring_type          VARCHAR(20) NOT NULL DEFAULT 'icpc';
+ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS freeze_time_minutes   INT;
+ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS status                VARCHAR(20) NOT NULL DEFAULT 'draft';
+ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS penalty_time_seconds  INT NOT NULL DEFAULT 1200;
+ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS allow_virtual         BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Extend contest_problems with IOI scoring support
+ALTER TABLE app.contest_problems ADD COLUMN IF NOT EXISTS max_points      INT NOT NULL DEFAULT 100;
+ALTER TABLE app.contest_problems ADD COLUMN IF NOT EXISTS scoring_config  JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- Extend test_cases with provenance tracking
+ALTER TABLE app.test_cases ADD COLUMN IF NOT EXISTS generator_batch_id INT;
+ALTER TABLE app.test_cases ADD COLUMN IF NOT EXISTS order_index        INT NOT NULL DEFAULT 0;
+ALTER TABLE app.test_cases ADD COLUMN IF NOT EXISTS created_by         INT;
+ALTER TABLE app.test_cases ADD COLUMN IF NOT EXISTS created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+-- 11. Problem Revisions — simple revision tracking
+CREATE TABLE IF NOT EXISTS app.problem_revisions (
+    id              SERIAL PRIMARY KEY,
+    problem_id      INT          NOT NULL REFERENCES app.problems(id) ON DELETE CASCADE,
+    revision        INT          NOT NULL,
+    title           VARCHAR(200) NOT NULL,
+    statement       TEXT         NOT NULL DEFAULT '',
+    difficulty      VARCHAR(20)  NOT NULL DEFAULT 'medium',
+    time_limit_ms   INT          NOT NULL DEFAULT 2000,
+    memory_limit_mb INT          NOT NULL DEFAULT 256,
+    checker_code    TEXT         NOT NULL DEFAULT '',
+    points          INT,
+    is_active       BOOLEAN      NOT NULL DEFAULT FALSE,
+    created_by      INT          NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE(problem_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_problem_revisions_problem ON app.problem_revisions (problem_id);
+
+-- 12. Problem Generators — C++ test generators (testlib.h)
+CREATE TABLE IF NOT EXISTS app.problem_generators (
+    id          SERIAL PRIMARY KEY,
+    problem_id  INT          NOT NULL REFERENCES app.problems(id) ON DELETE CASCADE,
+    name        VARCHAR(100) NOT NULL,
+    source_code TEXT         NOT NULL DEFAULT '',
+    description TEXT         NOT NULL DEFAULT '',
+    created_by  INT          NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_problem_generators_problem ON app.problem_generators (problem_id);
+
+-- 13. Problem Validators — input validators
+CREATE TABLE IF NOT EXISTS app.problem_validators (
+    id          SERIAL PRIMARY KEY,
+    problem_id  INT          NOT NULL REFERENCES app.problems(id) ON DELETE CASCADE,
+    name        VARCHAR(100) NOT NULL,
+    source_code TEXT         NOT NULL DEFAULT '',
+    is_active   BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_by  INT          NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_problem_validators_problem ON app.problem_validators (problem_id);
+
+-- 14. Problem Checkers — custom checkers (standard, partial, interactive)
+CREATE TABLE IF NOT EXISTS app.problem_checkers (
+    id           SERIAL PRIMARY KEY,
+    problem_id   INT          NOT NULL REFERENCES app.problems(id) ON DELETE CASCADE,
+    name         VARCHAR(100) NOT NULL,
+    source_code  TEXT         NOT NULL DEFAULT '',
+    checker_type VARCHAR(20)  NOT NULL DEFAULT 'standard',
+    is_active    BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_by   INT          NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_problem_checkers_problem ON app.problem_checkers (problem_id);
+
+-- 15. Problem Interactors — interactive problem communication programs
+CREATE TABLE IF NOT EXISTS app.problem_interactors (
+    id          SERIAL PRIMARY KEY,
+    problem_id  INT          NOT NULL REFERENCES app.problems(id) ON DELETE CASCADE,
+    name        VARCHAR(100) NOT NULL,
+    source_code TEXT         NOT NULL DEFAULT '',
+    is_active   BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_by  INT          NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_problem_interactors_problem ON app.problem_interactors (problem_id);
+
+-- 16. Problem Solutions — model/reference solutions
+CREATE TABLE IF NOT EXISTS app.problem_solutions (
+    id               SERIAL PRIMARY KEY,
+    problem_id       INT          NOT NULL REFERENCES app.problems(id) ON DELETE CASCADE,
+    name             VARCHAR(100) NOT NULL,
+    source_code      TEXT         NOT NULL DEFAULT '',
+    expected_verdict VARCHAR(30)  NOT NULL DEFAULT 'AC',
+    tag              VARCHAR(30)  NOT NULL DEFAULT 'main',
+    created_by       INT          NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_problem_solutions_problem ON app.problem_solutions (problem_id);
+
+-- 17. Generated Test Batches — track test generation runs
+CREATE TABLE IF NOT EXISTS app.generated_test_batches (
+    id            SERIAL PRIMARY KEY,
+    problem_id    INT         NOT NULL REFERENCES app.problems(id) ON DELETE CASCADE,
+    generator_id  INT         NOT NULL REFERENCES app.problem_generators(id) ON DELETE CASCADE,
+    args          TEXT        NOT NULL DEFAULT '',
+    test_count    INT         NOT NULL DEFAULT 0,
+    validated     BOOLEAN     NOT NULL DEFAULT FALSE,
+    created_by    INT         NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_gen_batches_problem ON app.generated_test_batches (problem_id);
+
+-- Add FK from test_cases to generated_test_batches (after table creation)
+ALTER TABLE app.test_cases ADD CONSTRAINT fk_test_cases_batch
+    FOREIGN KEY (generator_batch_id)
+    REFERENCES app.generated_test_batches(id) ON DELETE SET NULL;
+
+-- 18. Problem Access — per-problem RBAC
+CREATE TABLE IF NOT EXISTS app.problem_access (
+    id          SERIAL PRIMARY KEY,
+    problem_id  INT         NOT NULL REFERENCES app.problems(id) ON DELETE CASCADE,
+    user_id     INT         NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
+    role        VARCHAR(20) NOT NULL DEFAULT 'viewer',
+    granted_by  INT         NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
+    granted_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(problem_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_problem_access_problem ON app.problem_access (problem_id);
+CREATE INDEX IF NOT EXISTS idx_problem_access_user    ON app.problem_access (user_id);
+
+-- 19. Admin Audit Log — action audit trail
+CREATE TABLE IF NOT EXISTS app.admin_audit_log (
+    id          SERIAL PRIMARY KEY,
+    user_id     INT          NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
+    action      VARCHAR(100) NOT NULL,
+    entity_type VARCHAR(50)  NOT NULL,
+    entity_id   INT          NOT NULL,
+    details     JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    ip_address  VARCHAR(45)  NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_user      ON app.admin_audit_log (user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_action    ON app.admin_audit_log (action);
+CREATE INDEX IF NOT EXISTS idx_audit_log_entity    ON app.admin_audit_log (entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_created   ON app.admin_audit_log (created_at DESC);
