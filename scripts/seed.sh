@@ -98,7 +98,41 @@ for i in "${!USERNAMES[@]}"; do
   fi
 done
 
-ADMIN_TOKEN="${TOKENS[0]}"
+# ----------------------------------------------------------
+# 1b. Promote "admin" user to admin role via direct SQL
+# ----------------------------------------------------------
+echo ""
+echo "── Promoting admin user to admin role ────────────────"
+
+# Run SQL directly in the postgres container to set role = 'admin'
+docker compose exec -T postgres psql -U postgres -d coding_platform -c \
+  "UPDATE app.users SET role = 'admin' WHERE username = 'admin';" 2>/dev/null
+
+if [ $? -eq 0 ]; then
+  success "Promoted 'admin' to role = 'admin' in database"
+else
+  fail "Failed to promote admin user via SQL"
+  exit 1
+fi
+
+# Re-login as admin to get a JWT with the updated 'admin' role
+info "Re-logging in as admin to get admin-level token..."
+LOGIN_RESP=$(curl -s -w "\n%{http_code}" -X POST "$API/auth/login" \
+  -H "$CONTENT_TYPE" \
+  -d '{"login": "admin", "password": "'"$PASSWORD"'"}' 2>/dev/null)
+LOGIN_CODE=$(echo "$LOGIN_RESP" | tail -1)
+LOGIN_BODY=$(echo "$LOGIN_RESP" | sed '$d')
+
+if [ "$LOGIN_CODE" = "200" ]; then
+  ADMIN_TOKEN=$(echo "$LOGIN_BODY" | grep -o '"token":"[^"]*"' | head -1 | cut -d'"' -f4)
+  ADMIN_ROLE=$(echo "$LOGIN_BODY" | grep -o '"role":"[^"]*"' | head -1 | cut -d'"' -f4)
+  TOKENS[0]="$ADMIN_TOKEN"
+  success "Admin re-login successful (role: $ADMIN_ROLE)"
+else
+  fail "Failed to re-login as admin (HTTP $LOGIN_CODE)"
+  exit 1
+fi
+
 if [ -z "$ADMIN_TOKEN" ]; then
   fail "No admin token available. Cannot continue."
   exit 1
@@ -535,7 +569,163 @@ fi
 echo ""
 
 # ----------------------------------------------------------
-# 5. Summary
+# 5. Subjective problem (manual-grading only)
+# ----------------------------------------------------------
+echo "── Creating Subjective Problem ───────────────────────"
+
+# Small helpers to run SQL inside the postgres container. They swallow errors
+# so that set -euo pipefail doesn't abort the whole seed on transient issues.
+#
+# psql_query: returns the first line of output (the first RETURNING value or
+# the first column of the first row), stripped of whitespace. Any trailing
+# command tag like "INSERT 0 1" is discarded.
+psql_query() {
+  docker compose exec -T postgres psql -U postgres -d coding_platform -tAq -c "$1" 2>/dev/null \
+    | head -n 1 \
+    | tr -d '[:space:]' \
+    || echo ""
+}
+psql_exec() {
+  docker compose exec -T postgres psql -U postgres -d coding_platform -q -c "$1" >/dev/null 2>&1 || true
+}
+
+SUBJECTIVE_SLUG="essay-binary-search"
+SUBJECTIVE_ID=$(psql_query "SELECT id FROM app.problems WHERE slug = '$SUBJECTIVE_SLUG' LIMIT 1;")
+
+if [ -z "$SUBJECTIVE_ID" ]; then
+  SUBJECTIVE_STATEMENT='## Design: Binary Search Variants\n\nImplement binary search in C++ and briefly explain (in comments) the invariant you maintain.\n\nYour submission will be **manually reviewed**. There are no automated test cases — focus on clarity, correctness of the invariant, and edge-case handling.\n\n### Deliverable\n- A complete, compilable C++ program that reads `n target` then `n` sorted integers and prints the index (0-based) or `-1`.\n- In comments at the top, state (1) your loop invariant and (2) why the loop terminates.'
+  SUBJECTIVE_ID=$(psql_query "INSERT INTO app.problems (title, slug, statement, difficulty, time_limit_ms, memory_limit_mb, problem_type, created_by)
+     VALUES ('Binary Search: Design & Explain', '$SUBJECTIVE_SLUG', E'$SUBJECTIVE_STATEMENT', 'medium', 2000, 256, 'subjective',
+             (SELECT id FROM app.users WHERE username='admin'))
+     RETURNING id;")
+  if [ -n "$SUBJECTIVE_ID" ]; then
+    success "Created subjective problem: $SUBJECTIVE_SLUG (id=$SUBJECTIVE_ID)"
+  else
+    fail "Failed to create subjective problem"
+  fi
+else
+  warn "Subjective problem $SUBJECTIVE_SLUG already exists (id=$SUBJECTIVE_ID) — skipping"
+fi
+echo ""
+
+# ----------------------------------------------------------
+# 6. Create a group + members + pending join request
+# ----------------------------------------------------------
+echo "── Creating Group & Members ──────────────────────────"
+
+# Fetch user IDs (we need them for the group creation and member addition)
+ALICE_ID=$(psql_query "SELECT id FROM app.users WHERE username = 'alice'   LIMIT 1;")
+BOB_ID=$(psql_query   "SELECT id FROM app.users WHERE username = 'bob'     LIMIT 1;")
+CHARLIE_ID=$(psql_query "SELECT id FROM app.users WHERE username = 'charlie' LIMIT 1;")
+DIANA_ID=$(psql_query "SELECT id FROM app.users WHERE username = 'diana'   LIMIT 1;")
+
+GROUP_NAME="CS101 Spring 2026"
+GROUP_ID=""
+
+# Try to create the group — handle the "already exists" case gracefully.
+RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$API/admin/groups" \
+  -H "$CONTENT_TYPE" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d "{
+    \"name\": \"$GROUP_NAME\",
+    \"description\": \"Sample course group used to demonstrate group-only assignments, manual grading and proctoring.\",
+    \"admin_user_ids\": [${CHARLIE_ID:-0}]
+  }" 2>/dev/null)
+
+HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+BODY=$(echo "$RESPONSE" | sed '$d')
+
+if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ]; then
+  GROUP_ID=$(echo "$BODY" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  success "Created group '$GROUP_NAME' (id=$GROUP_ID)"
+elif [ "$HTTP_CODE" = "409" ]; then
+  GROUP_ID=$(psql_query "SELECT id FROM app.groups WHERE name = '$GROUP_NAME' LIMIT 1;")
+  warn "Group already exists (id=$GROUP_ID) — reusing"
+else
+  fail "Failed to create group (HTTP $HTTP_CODE): $BODY"
+fi
+
+add_group_member() {
+  local USER_ID="$1"
+  local ROLE="$2"
+  [ -z "$USER_ID" ] && return
+  [ -z "$GROUP_ID" ] && return
+  RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$API/admin/groups/$GROUP_ID/members" \
+    -H "$CONTENT_TYPE" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -d "{\"user_id\": $USER_ID, \"role\": \"$ROLE\"}" 2>/dev/null)
+  CODE=$(echo "$RESPONSE" | tail -1)
+  if [ "$CODE" = "200" ] || [ "$CODE" = "201" ]; then
+    success "Added user #$USER_ID as $ROLE"
+  else
+    warn "Could not add user #$USER_ID (HTTP $CODE)"
+  fi
+}
+
+if [ -n "$GROUP_ID" ]; then
+  add_group_member "$ALICE_ID" "member"
+  add_group_member "$BOB_ID"   "member"
+  # charlie was added as admin in the create call, but make sure
+  [ -n "$CHARLIE_ID" ] && add_group_member "$CHARLIE_ID" "admin"
+
+  # Create a pending join request from diana (so admins can demo the approval flow)
+  if [ -n "$DIANA_ID" ]; then
+    psql_exec "INSERT INTO app.group_join_requests (group_id, user_id, status, message)
+       VALUES ($GROUP_ID, $DIANA_ID, 'pending', 'Hi! I''m a CS101 student — please add me.')
+       ON CONFLICT DO NOTHING;"
+    success "Created pending join request from diana"
+  fi
+fi
+echo ""
+
+# ----------------------------------------------------------
+# 7. Group-only contest (proctored, subjective + standard, partial scoring)
+# ----------------------------------------------------------
+echo "── Creating Group Contest ────────────────────────────"
+
+GROUP_CONTEST_START="2026-04-01T09:00:00Z"
+GROUP_CONTEST_END="2026-04-01T12:00:00Z"
+
+if [ -n "$GROUP_ID" ] && [ -n "$TWO_SUM_ID" ] && [ -n "$FIBONACCI_ID" ] && [ -n "$SUBJECTIVE_ID" ]; then
+  # The seed is also idempotent: skip if a contest with this title already exists for the group.
+  EXISTING=$(psql_query "SELECT id FROM app.contests WHERE group_id = $GROUP_ID AND title = 'CS101 Assignment 1' LIMIT 1;")
+
+  if [ -n "$EXISTING" ]; then
+    warn "Group contest 'CS101 Assignment 1' already exists (id=$EXISTING) — skipping"
+  else
+    RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$API/contests" \
+      -H "$CONTENT_TYPE" \
+      -H "Authorization: Bearer $ADMIN_TOKEN" \
+      -d "{
+        \"title\": \"CS101 Assignment 1\",
+        \"description\": \"Group-only assignment. Proctored. Mix of auto-graded and manually graded problems. Grades are visible to the whole group.\",
+        \"start_time\": \"$GROUP_CONTEST_START\",
+        \"end_time\": \"$GROUP_CONTEST_END\",
+        \"is_rated\": false,
+        \"group_id\": $GROUP_ID,
+        \"proctored\": true,
+        \"grade_visibility\": \"group\",
+        \"problems\": [
+          {\"problem_id\": $TWO_SUM_ID,     \"points\": 100, \"problem_order\": 1, \"scoring_mode\": \"partial\"},
+          {\"problem_id\": $FIBONACCI_ID,   \"points\": 100, \"problem_order\": 2, \"scoring_mode\": \"partial\"},
+          {\"problem_id\": $SUBJECTIVE_ID,  \"points\": 200, \"problem_order\": 3, \"scoring_mode\": \"all_or_nothing\"}
+        ]
+      }" 2>/dev/null)
+
+    HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+    if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ]; then
+      success "Created group contest 'CS101 Assignment 1' (proctored, group-visible)"
+    else
+      fail "Failed to create group contest (HTTP $HTTP_CODE): $(echo "$RESPONSE" | sed '$d')"
+    fi
+  fi
+else
+  warn "Skipping group contest — missing group or problem IDs"
+fi
+echo ""
+
+# ----------------------------------------------------------
+# 8. Summary
 # ----------------------------------------------------------
 echo "═══════════════════════════════════════════════════"
 echo "  Seed Complete!"
@@ -543,9 +733,14 @@ echo "════════════════════════�
 echo ""
 echo "  Users:     ${#USERNAMES[@]} (admin, alice, bob, charlie, diana, eve)"
 echo "  Password:  $PASSWORD (for all users)"
-echo "  Problems:  12 (4 easy, 4 medium, 2 hard, 2 hard)"
-echo "  Tags:      All 12 problems tagged"
-echo "  Contests:  3 (1 ended, 2 upcoming)"
+echo "  Roles:     admin → site admin | others → user"
+echo "  Problems:  13 (12 standard + 1 subjective, all tagged)"
+echo "  Contests:  4 (3 global + 1 group-only, proctored, partial scoring)"
+echo "  Groups:    1 (CS101 Spring 2026)"
+echo "             • admin, charlie → group admins"
+echo "             • alice, bob     → members"
+echo "             • diana          → pending join request"
 echo ""
-echo "  Login at http://localhost:8080 with any user above."
+echo "  Frontend:      http://localhost:8080 (any user)"
+echo "  Admin Portal:  http://localhost:8081 (admin / $PASSWORD)"
 echo ""

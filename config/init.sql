@@ -357,3 +357,84 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_user      ON app.admin_audit_log (user_
 CREATE INDEX IF NOT EXISTS idx_audit_log_action    ON app.admin_audit_log (action);
 CREATE INDEX IF NOT EXISTS idx_audit_log_entity    ON app.admin_audit_log (entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_audit_log_created   ON app.admin_audit_log (created_at DESC);
+
+
+-- ============================================================
+-- GROUPS / GROUP CONTESTS / PROCTORING / SUBJECTIVE / GRADING
+-- ============================================================
+
+-- 20. Groups
+CREATE TABLE IF NOT EXISTS app.groups (
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(100) NOT NULL UNIQUE,
+    description TEXT         NOT NULL DEFAULT '',
+    created_by  INT          NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_groups_name ON app.groups (name);
+
+-- 21. Group Members (role is 'member' or 'admin' within the group)
+CREATE TABLE IF NOT EXISTS app.group_members (
+    group_id   INT         NOT NULL REFERENCES app.groups(id) ON DELETE CASCADE,
+    user_id    INT         NOT NULL REFERENCES app.users(id)  ON DELETE CASCADE,
+    role       VARCHAR(20) NOT NULL DEFAULT 'member',
+    joined_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (group_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_group_members_user ON app.group_members (user_id);
+
+-- 22. Group Join Requests
+CREATE TABLE IF NOT EXISTS app.group_join_requests (
+    id          SERIAL PRIMARY KEY,
+    group_id    INT          NOT NULL REFERENCES app.groups(id) ON DELETE CASCADE,
+    user_id     INT          NOT NULL REFERENCES app.users(id)  ON DELETE CASCADE,
+    status      VARCHAR(20)  NOT NULL DEFAULT 'pending',
+    message     TEXT         NOT NULL DEFAULT '',
+    decided_by  INT                   REFERENCES app.users(id)  ON DELETE SET NULL,
+    decided_at  TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_gjr_group  ON app.group_join_requests (group_id);
+CREATE INDEX IF NOT EXISTS idx_gjr_user   ON app.group_join_requests (user_id);
+CREATE INDEX IF NOT EXISTS idx_gjr_status ON app.group_join_requests (status);
+
+-- Only one pending request per (group, user)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gjr_one_pending
+    ON app.group_join_requests (group_id, user_id)
+    WHERE status = 'pending';
+
+-- 23. Contests: group association + proctoring + grade visibility
+ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS group_id           INT REFERENCES app.groups(id) ON DELETE SET NULL;
+ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS proctored          BOOLEAN     NOT NULL DEFAULT FALSE;
+ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS grade_visibility   VARCHAR(20) NOT NULL DEFAULT 'private';
+
+CREATE INDEX IF NOT EXISTS idx_contests_group ON app.contests (group_id);
+
+-- 24. Problems: problem type (standard vs subjective)
+ALTER TABLE app.problems ADD COLUMN IF NOT EXISTS problem_type VARCHAR(20) NOT NULL DEFAULT 'standard';
+
+-- 25. Contest problems: per-problem scoring mode (all_or_nothing vs partial)
+ALTER TABLE app.contest_problems ADD COLUMN IF NOT EXISTS scoring_mode VARCHAR(20) NOT NULL DEFAULT 'all_or_nothing';
+
+-- 26. Submissions: manual grading / feedback / lock
+ALTER TABLE app.submissions ADD COLUMN IF NOT EXISTS manual_score INT;
+ALTER TABLE app.submissions ADD COLUMN IF NOT EXISTS feedback     TEXT        NOT NULL DEFAULT '';
+ALTER TABLE app.submissions ADD COLUMN IF NOT EXISTS graded_by    INT         REFERENCES app.users(id) ON DELETE SET NULL;
+ALTER TABLE app.submissions ADD COLUMN IF NOT EXISTS graded_at    TIMESTAMPTZ;
+ALTER TABLE app.submissions ADD COLUMN IF NOT EXISTS is_locked    BOOLEAN     NOT NULL DEFAULT FALSE;
+
+-- 27. Proctor events — monitoring log
+CREATE TABLE IF NOT EXISTS app.proctor_events (
+    id         SERIAL PRIMARY KEY,
+    contest_id INT          NOT NULL REFERENCES app.contests(id) ON DELETE CASCADE,
+    user_id    INT          NOT NULL REFERENCES app.users(id)    ON DELETE CASCADE,
+    event_type VARCHAR(50)  NOT NULL,
+    details    JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_proctor_events_contest_user ON app.proctor_events (contest_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_proctor_events_created      ON app.proctor_events (created_at DESC);
