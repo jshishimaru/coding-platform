@@ -48,11 +48,16 @@ CREATE TABLE IF NOT EXISTS app.users (
     role          VARCHAR(20)  NOT NULL DEFAULT 'user',
     permissions   JSONB        NOT NULL DEFAULT '{}'::jsonb,
     rating        INT          NOT NULL DEFAULT 1200,
+    is_banned     BOOLEAN      NOT NULL DEFAULT FALSE,
+    banned_at     TIMESTAMPTZ,
+    banned_by     INT                   REFERENCES app.users(id) ON DELETE SET NULL,
+    ban_reason    TEXT         NOT NULL DEFAULT '',
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_username ON app.users (username);
 CREATE INDEX IF NOT EXISTS idx_users_email    ON app.users (email);
+CREATE INDEX IF NOT EXISTS idx_users_is_banned ON app.users (is_banned);
 
 -- 2. Contests
 CREATE TABLE IF NOT EXISTS app.contests (

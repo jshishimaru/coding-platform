@@ -60,6 +60,9 @@ services:
       - REDIS_HOST=coding-platform-redis
       - REDIS_PORT=6379
       - FRONTEND_URL=http://localhost:8080
+      # Cap concurrent sandbox executions so a flood of submissions can't
+      # multiply the per-submission memory budget beyond the container cap.
+      - SANDBOX_SLOTS=${SANDBOX_SLOTS:-4}
     depends_on:
       postgres:
         condition: service_healthy
@@ -67,6 +70,34 @@ services:
         condition: service_healthy
     networks:
       - coding-platform-network
+    # ── Container-level resource caps ─────────────────────────────────
+    # Belt-and-suspenders to the per-submission rlimits inside the sandbox:
+    # even if a submission escapes its limits, the container is capped so
+    # the host machine is not at risk.
+    #
+    # mem_limit: hard memory ceiling (OOM-kills the container, not the host)
+    # memswap_limit == mem_limit: disables swap (prevents thrashing)
+    # pids_limit: global process cap (fork-bomb defense across all submissions)
+    # cpus: fair share of host CPU (prevents CPU starvation of other services)
+    #
+    # Tune these to your deployment. Defaults assume a small VM.
+    mem_limit: ${BACKEND_MEM_LIMIT:-2g}
+    memswap_limit: ${BACKEND_MEM_LIMIT:-2g}
+    pids_limit: ${BACKEND_PIDS_LIMIT:-512}
+    cpus: ${BACKEND_CPUS:-2.0}
+    # Defense-in-depth: drop all Linux capabilities the backend doesn't need.
+    # We keep SETUID/SETGID because the sandbox drops to uid 1001 before exec,
+    # and CHOWN because Alpine's adduser/chown in entrypoint may need it.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
       interval: 10s
