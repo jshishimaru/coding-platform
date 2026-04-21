@@ -58,7 +58,22 @@ Start all services using Docker Compose:
 This script will start the containers and check their health. Once running, you can access the platform at:
 
 - **Frontend:** [http://localhost:8080](http://localhost:8080)
+- **Admin frontend:** [http://localhost:8081](http://localhost:8081)
 - **Backend API:** [http://localhost:3000/api/health](http://localhost:3000/api/health)
+- **Database admin (Adminer):** [http://localhost:8082](http://localhost:8082)
+
+## Database admin (Adminer)
+
+A lightweight [Adminer](https://www.adminer.org/) instance runs alongside the app and gives you a Django-admin-style UI over every table in the `app` schema, with full CRUD (list, filter, sort, insert, edit, delete, bulk actions, SQL console). Because it introspects `information_schema` live, it picks up new tables/columns automatically whenever [`config/init.sql`](config/init.sql) or a future migration runs — no redeploy needed.
+
+- URL: [http://localhost:8082](http://localhost:8082)
+- System: **PostgreSQL**
+- Server: `coding-platform-postgres` (pre-filled)
+- Username / Password: from your `.env` (defaults: `postgres` / `postgres`)
+- Database: `coding_platform`
+- Schema: `app`
+
+**Usage caveat:** Adminer writes directly to the live database. There is no app-level guardrail — no `admin_audit_log` entry, no soft-delete, no role-aware hiding. Use Adminer for read, debugging, and small fixes; prefer the admin frontend for routine operations, since that path writes to the audit log.
 
 ## Architecture
 

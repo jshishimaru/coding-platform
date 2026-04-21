@@ -20,6 +20,7 @@ export REDIS_PORT=6380
 export BACKEND_PORT=3000
 export FRONTEND_PORT=8080
 export ADMIN_PORT=8081
+export ADMINER_PORT=8082
 
 # Fix permissions on data directories
 echo "🔧 Fixing data directory permissions..."
@@ -76,13 +77,23 @@ else
     echo "⚠️  $container_status"
 fi
 
+# Check adminer (DB admin UI)
+echo -n "  Adminer (DB):   "
+container_status=$(docker inspect --format='{{.State.Status}}' coding-platform-adminer 2>/dev/null || echo "not found")
+if [ "$container_status" = "running" ]; then
+    echo "✅ running"
+else
+    echo "⚠️  $container_status"
+fi
+
 echo ""
 echo "================================================"
 echo "✅ Services Started!"
 echo ""
 echo "📊 Access Points:"
 echo "  - Frontend:     http://localhost:$FRONTEND_PORT"
-echo "  - Admin Portal:  http://localhost:$ADMIN_PORT"
+echo "  - Admin Portal: http://localhost:$ADMIN_PORT"
+echo "  - DB Admin:     http://localhost:$ADMINER_PORT  (Adminer, PostgreSQL, server: coding-platform-postgres, db: coding_platform)"
 echo "  - Backend API:  http://localhost:$BACKEND_PORT/api/health"
 echo "  - PostgreSQL:   localhost:$POSTGRES_PORT"
 echo "  - Redis:        localhost:$REDIS_PORT"
