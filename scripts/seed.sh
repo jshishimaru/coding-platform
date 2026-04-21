@@ -140,11 +140,60 @@ fi
 echo ""
 
 # ----------------------------------------------------------
+# SQL helpers
+# ----------------------------------------------------------
+# Small helpers to run SQL inside the postgres container. They swallow errors
+# so that set -euo pipefail doesn't abort the whole seed on transient issues.
+#
+# psql_query: returns the first line of output (the first RETURNING value or
+# the first column of the first row), stripped of whitespace. Any trailing
+# command tag like "INSERT 0 1" is discarded.
+psql_query() {
+  docker compose exec -T postgres psql -U postgres -d coding_platform -tAq -c "$1" 2>/dev/null \
+    | head -n 1 \
+    | tr -d '[:space:]' \
+    || echo ""
+}
+psql_exec() {
+  docker compose exec -T postgres psql -U postgres -d coding_platform -q -c "$1" >/dev/null 2>&1 || true
+}
+
+# ----------------------------------------------------------
 # 2. Create problems (questions with test cases)
 # ----------------------------------------------------------
 echo "── Creating Problems ─────────────────────────────────"
 
 declare -a PROBLEM_SLUGS
+
+ensure_problem_revision() {
+  local SLUG="$1"
+
+  psql_exec "
+    INSERT INTO app.problem_revisions
+      (problem_id, revision, title, statement, difficulty, time_limit_ms,
+       memory_limit_mb, checker_code, points, is_active, created_by)
+    SELECT p.id, 1, p.title, p.statement, p.difficulty, p.time_limit_ms,
+           p.memory_limit_mb, p.checker_code, p.points, TRUE, p.created_by
+      FROM app.problems p
+     WHERE p.slug = '$SLUG'
+    ON CONFLICT (problem_id, revision) DO UPDATE
+       SET title = EXCLUDED.title,
+           statement = EXCLUDED.statement,
+           difficulty = EXCLUDED.difficulty,
+           time_limit_ms = EXCLUDED.time_limit_ms,
+           memory_limit_mb = EXCLUDED.memory_limit_mb,
+           checker_code = EXCLUDED.checker_code,
+           points = EXCLUDED.points,
+           is_active = TRUE;
+
+    UPDATE app.problem_revisions pr
+       SET is_active = FALSE
+      FROM app.problems p
+     WHERE pr.problem_id = p.id
+       AND p.slug = '$SLUG'
+       AND pr.revision <> 1;
+  "
+}
 
 create_problem() {
   local SLUG="$1"
@@ -160,8 +209,10 @@ create_problem() {
 
   if [ "$HTTP_CODE" = "201" ]; then
     success "Created problem: $SLUG"
+    ensure_problem_revision "$SLUG"
   elif [ "$HTTP_CODE" = "409" ]; then
     warn "Problem $SLUG already exists — skipping"
+    ensure_problem_revision "$SLUG"
   else
     fail "Failed to create $SLUG (HTTP $HTTP_CODE): $BODY"
   fi
@@ -394,11 +445,9 @@ echo ""
 # ----------------------------------------------------------
 echo "── Fetching Problem IDs ────────────────────────────"
 
-QUESTIONS_JSON=$(curl -s "$API/questions" -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null)
-
 get_problem_id() {
   local slug="$1"
-  echo "$QUESTIONS_JSON" | grep -o "\"id\":[0-9]*,\"title\":\"[^\"]*\",\"slug\":\"$slug\"" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2
+  psql_query "SELECT id FROM app.problems WHERE slug = '$slug' LIMIT 1;"
 }
 
 TWO_SUM_ID=$(get_problem_id "two-sum")
@@ -466,7 +515,123 @@ assign_tags "detect-cycle-graph"       "Graph" "Tree" "Recursion"
 echo ""
 
 # ----------------------------------------------------------
-# 4. Create contests
+# 4. Seed advanced problem components + publish problems
+# ----------------------------------------------------------
+echo "── Seeding Validators / Checkers / Generators ────────"
+
+create_component() {
+  local PROBLEM_ID="$1"
+  local COMPONENT_TYPE="$2"
+  local PAYLOAD="$3"
+  local LABEL="$4"
+
+  if [ -z "$PROBLEM_ID" ]; then
+    warn "Skipping $LABEL — missing problem id"
+    return
+  fi
+
+  RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$API/admin/problems/$PROBLEM_ID/$COMPONENT_TYPE" \
+    -H "$CONTENT_TYPE" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -d "$PAYLOAD" 2>/dev/null)
+  HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+
+  if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+    success "$LABEL"
+  else
+    warn "Could not seed $LABEL (HTTP $HTTP_CODE)"
+  fi
+}
+
+# two-sum: standard validator + checker + canonical AC solution
+create_component "$TWO_SUM_ID" "validators" '{
+  "name": "nums-range-validator",
+  "source_code": "#include <bits/stdc++.h>\nusing namespace std;\nint main(){ios::sync_with_stdio(false);cin.tie(nullptr);int n; long long target; if(!(cin>>n>>target)) return 1; if(n<2||n>100000) return 1; for(int i=0;i<n;i++){ long long x; if(!(cin>>x)) return 1; if(x < -1000000000LL || x > 1000000000LL) return 1; } return 0;}"
+}' "Seeded validator for two-sum"
+
+create_component "$TWO_SUM_ID" "checkers" '{
+  "name": "exact-output-checker",
+  "checker_type": "standard",
+  "source_code": "#include <bits/stdc++.h>\nusing namespace std;\nint main(){ios::sync_with_stdio(false);cin.tie(nullptr);string a,b;getline(cin,a);getline(cin,b);while(!a.empty()&&(a.back()==char(13)||a.back()==char(10)||isspace((unsigned char)a.back())))a.pop_back();while(!b.empty()&&(b.back()==char(13)||b.back()==char(10)||isspace((unsigned char)b.back())))b.pop_back();return a==b?0:1;}"
+}' "Seeded checker for two-sum"
+
+create_component "$TWO_SUM_ID" "solutions" '{
+  "name": "two-sum-ac",
+  "expected_verdict": "AC",
+  "tag": "main",
+  "source_code": "#include <bits/stdc++.h>\nusing namespace std;\nint main(){ios::sync_with_stdio(false);cin.tie(nullptr);int n; long long target; if(!(cin>>n>>target)) return 0; vector<long long>a(n); for(int i=0;i<n;i++)cin>>a[i]; unordered_map<long long,int> mp; for(int i=0;i<n;i++){ long long need=target-a[i]; if(mp.count(need)){ cout<<mp[need]<<\" \"<<i<<\"\\n\"; return 0; } mp[a[i]]=i; } return 0;}"
+}' "Seeded AC solution for two-sum"
+
+# fibonacci: generator + alt AC solution
+create_component "$FIBONACCI_ID" "generators" '{
+  "name": "small-random-n",
+  "description": "Generates random n in [0,45]",
+  "source_code": "#include <bits/stdc++.h>\nusing namespace std;\nint main(int argc,char** argv){ mt19937 rng((uint32_t)chrono::steady_clock::now().time_since_epoch().count()); uniform_int_distribution<int> dist(0,45); cout<<dist(rng)<<\"\\n\"; return 0; }"
+}' "Seeded generator for fibonacci"
+
+create_component "$FIBONACCI_ID" "solutions" '{
+  "name": "fibonacci-dp-ac",
+  "expected_verdict": "AC",
+  "tag": "main",
+  "source_code": "#include <bits/stdc++.h>\nusing namespace std;\nint main(){ios::sync_with_stdio(false);cin.tie(nullptr);int n; if(!(cin>>n)) return 0; long long a=0,b=1; for(int i=0;i<n;i++){ long long c=a+b; a=b; b=c; } cout<<a<<\"\\n\"; return 0;}"
+}' "Seeded AC solution for fibonacci"
+
+# maximum-subarray: partial checker seed example
+create_component "$MAX_SUBARRAY_ID" "checkers" '{
+  "name": "whitespace-insensitive-checker",
+  "checker_type": "partial",
+  "source_code": "#include <bits/stdc++.h>\nusing namespace std;\nstring norm(const string&s){ string t; for(char c:s) if(!isspace((unsigned char)c)) t.push_back(c); return t; }\nint main(){ios::sync_with_stdio(false);cin.tie(nullptr);string jury,cont;getline(cin,jury);getline(cin,cont);return norm(jury)==norm(cont)?0:1;}"
+}' "Seeded partial-style checker for maximum-subarray"
+
+# shortest-path-grid: interactor + wrong answer solution for testing panel
+create_component "$SHORTEST_PATH_ID" "interactors" '{
+  "name": "dummy-grid-interactor",
+  "source_code": "#include <bits/stdc++.h>\nusing namespace std;\nint main(){ return 0; }"
+}' "Seeded interactor for shortest-path-grid"
+
+create_component "$SHORTEST_PATH_ID" "solutions" '{
+  "name": "intentional-wa",
+  "expected_verdict": "WA",
+  "tag": "negative",
+  "source_code": "#include <bits/stdc++.h>\nusing namespace std;\nint main(){ cout<<-1<<\"\\n\"; return 0; }"
+}' "Seeded WA solution for shortest-path-grid"
+
+echo ""
+echo "── Publishing Created Problems ───────────────────────"
+
+publish_problem() {
+  local PID="$1"
+  local LABEL="$2"
+  [ -z "$PID" ] && return
+  RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$API/admin/problems/$PID/publish" \
+    -H "$CONTENT_TYPE" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -d '{}' 2>/dev/null)
+  CODE=$(echo "$RESPONSE" | tail -1)
+  if [ "$CODE" = "200" ] || [ "$CODE" = "201" ]; then
+    success "Published $LABEL"
+  else
+    warn "Could not publish $LABEL (HTTP $CODE)"
+  fi
+}
+
+publish_problem "$TWO_SUM_ID" "two-sum"
+publish_problem "$REVERSE_STRING_ID" "reverse-string"
+publish_problem "$FIBONACCI_ID" "fibonacci-number"
+publish_problem "$PARENTHESES_ID" "valid-parentheses"
+publish_problem "$MAX_SUBARRAY_ID" "maximum-subarray"
+publish_problem "$MERGE_ARRAYS_ID" "merge-sorted-arrays"
+publish_problem "$LCS_ID" "longest-common-subsequence"
+publish_problem "$BINARY_SEARCH_ID" "binary-search"
+publish_problem "$COIN_CHANGE_ID" "coin-change"
+publish_problem "$NQUEENS_ID" "n-queens"
+publish_problem "$SHORTEST_PATH_ID" "shortest-path-grid"
+publish_problem "$CYCLE_DETECT_ID" "detect-cycle-graph"
+
+echo ""
+
+# ----------------------------------------------------------
+# 5. Create contests
 # ----------------------------------------------------------
 echo "── Creating Contests ─────────────────────────────────"
 
@@ -569,25 +734,9 @@ fi
 echo ""
 
 # ----------------------------------------------------------
-# 5. Subjective problem (manual-grading only)
+# 6. Subjective problem (manual-grading only)
 # ----------------------------------------------------------
 echo "── Creating Subjective Problem ───────────────────────"
-
-# Small helpers to run SQL inside the postgres container. They swallow errors
-# so that set -euo pipefail doesn't abort the whole seed on transient issues.
-#
-# psql_query: returns the first line of output (the first RETURNING value or
-# the first column of the first row), stripped of whitespace. Any trailing
-# command tag like "INSERT 0 1" is discarded.
-psql_query() {
-  docker compose exec -T postgres psql -U postgres -d coding_platform -tAq -c "$1" 2>/dev/null \
-    | head -n 1 \
-    | tr -d '[:space:]' \
-    || echo ""
-}
-psql_exec() {
-  docker compose exec -T postgres psql -U postgres -d coding_platform -q -c "$1" >/dev/null 2>&1 || true
-}
 
 SUBJECTIVE_SLUG="essay-binary-search"
 SUBJECTIVE_ID=$(psql_query "SELECT id FROM app.problems WHERE slug = '$SUBJECTIVE_SLUG' LIMIT 1;")
@@ -609,7 +758,7 @@ fi
 echo ""
 
 # ----------------------------------------------------------
-# 6. Create a group + members + pending join request
+# 7. Create a group + members + pending join request
 # ----------------------------------------------------------
 echo "── Creating Group & Members ──────────────────────────"
 
@@ -679,7 +828,7 @@ fi
 echo ""
 
 # ----------------------------------------------------------
-# 7. Group-only contest (proctored, subjective + standard, partial scoring)
+# 8. Group-only contest (proctored, subjective + standard, partial scoring)
 # ----------------------------------------------------------
 echo "── Creating Group Contest ────────────────────────────"
 
@@ -725,7 +874,7 @@ fi
 echo ""
 
 # ----------------------------------------------------------
-# 8. Summary
+# 9. Summary
 # ----------------------------------------------------------
 echo "═══════════════════════════════════════════════════"
 echo "  Seed Complete!"

@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS app.users (
     email         VARCHAR(255) NOT NULL UNIQUE,
     password_hash VARCHAR(255) NOT NULL,
     role          VARCHAR(20)  NOT NULL DEFAULT 'user',
+    permissions   JSONB        NOT NULL DEFAULT '{}'::jsonb,
     rating        INT          NOT NULL DEFAULT 1200,
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
@@ -61,6 +62,13 @@ CREATE TABLE IF NOT EXISTS app.contests (
     start_time  TIMESTAMPTZ  NOT NULL,
     end_time    TIMESTAMPTZ  NOT NULL,
     is_rated    BOOLEAN      NOT NULL DEFAULT FALSE,
+    scoring_type VARCHAR(20)  NOT NULL DEFAULT 'icpc',
+    freeze_time_minutes INT,
+    status      VARCHAR(20)  NOT NULL DEFAULT 'draft',
+    penalty_time_seconds INT  NOT NULL DEFAULT 1200,
+    allow_virtual BOOLEAN    NOT NULL DEFAULT FALSE,
+    proctored   BOOLEAN      NOT NULL DEFAULT FALSE,
+    grade_visibility VARCHAR(20) NOT NULL DEFAULT 'private',
     created_by  INT          NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
@@ -78,9 +86,11 @@ CREATE TABLE IF NOT EXISTS app.problems (
     time_limit_ms   INT          NOT NULL DEFAULT 2000,
     memory_limit_mb INT          NOT NULL DEFAULT 256,
     checker_code    TEXT         NOT NULL DEFAULT '',
+    problem_type    VARCHAR(20)  NOT NULL DEFAULT 'standard',
     created_by      INT          NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
     contest_id      INT                   REFERENCES app.contests(id) ON DELETE SET NULL,
     points          INT,
+    published_at    TIMESTAMPTZ,
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
@@ -102,6 +112,11 @@ CREATE TABLE IF NOT EXISTS app.submissions (
     passed_count INT          DEFAULT 0,
     total_count  INT          DEFAULT 0,
     result_details JSONB,
+    manual_score INT,
+    feedback     TEXT         NOT NULL DEFAULT '',
+    graded_by    INT                   REFERENCES app.users(id) ON DELETE SET NULL,
+    graded_at    TIMESTAMPTZ,
+    is_locked    BOOLEAN      NOT NULL DEFAULT FALSE,
     submitted_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
@@ -116,7 +131,11 @@ CREATE TABLE IF NOT EXISTS app.test_cases (
     problem_id      INT     NOT NULL REFERENCES app.problems(id) ON DELETE CASCADE,
     input           TEXT    NOT NULL DEFAULT '',
     expected_output TEXT    NOT NULL DEFAULT '',
-    is_sample       BOOLEAN NOT NULL DEFAULT FALSE
+    is_sample       BOOLEAN NOT NULL DEFAULT FALSE,
+    generator_batch_id INT,
+    order_index     INT     NOT NULL DEFAULT 0,
+    created_by      INT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_test_cases_problem ON app.test_cases (problem_id);
@@ -146,7 +165,10 @@ CREATE TABLE IF NOT EXISTS app.contest_problems (
     contest_id      INT NOT NULL REFERENCES app.contests(id) ON DELETE CASCADE,
     problem_id      INT NOT NULL REFERENCES app.problems(id) ON DELETE CASCADE,
     points          INT NOT NULL DEFAULT 100,
+    max_points      INT NOT NULL DEFAULT 100,
     problem_order   INT NOT NULL DEFAULT 0,
+    scoring_config  JSONB NOT NULL DEFAULT '{}'::jsonb,
+    scoring_mode    VARCHAR(20) NOT NULL DEFAULT 'all_or_nothing',
     UNIQUE(contest_id, problem_id)
 );
 
@@ -195,26 +217,6 @@ ON CONFLICT (name) DO NOTHING;
 -- ============================================================
 -- ADMIN PORTAL TABLES
 -- ============================================================
-
--- Add permissions column to users (fine-grained RBAC overrides)
-ALTER TABLE app.users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '{}'::jsonb;
-
--- Extend contests with scoring configuration and lifecycle state
-ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS scoring_type          VARCHAR(20) NOT NULL DEFAULT 'icpc';
-ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS freeze_time_minutes   INT;
-ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS status                VARCHAR(20) NOT NULL DEFAULT 'draft';
-ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS penalty_time_seconds  INT NOT NULL DEFAULT 1200;
-ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS allow_virtual         BOOLEAN NOT NULL DEFAULT FALSE;
-
--- Extend contest_problems with IOI scoring support
-ALTER TABLE app.contest_problems ADD COLUMN IF NOT EXISTS max_points      INT NOT NULL DEFAULT 100;
-ALTER TABLE app.contest_problems ADD COLUMN IF NOT EXISTS scoring_config  JSONB NOT NULL DEFAULT '{}'::jsonb;
-
--- Extend test_cases with provenance tracking
-ALTER TABLE app.test_cases ADD COLUMN IF NOT EXISTS generator_batch_id INT;
-ALTER TABLE app.test_cases ADD COLUMN IF NOT EXISTS order_index        INT NOT NULL DEFAULT 0;
-ALTER TABLE app.test_cases ADD COLUMN IF NOT EXISTS created_by         INT;
-ALTER TABLE app.test_cases ADD COLUMN IF NOT EXISTS created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 -- 11. Problem Revisions — simple revision tracking
 CREATE TABLE IF NOT EXISTS app.problem_revisions (
@@ -413,28 +415,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_gjr_one_pending
 
 -- 23. Contests: group association + proctoring + grade visibility
 ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS group_id           INT REFERENCES app.groups(id) ON DELETE SET NULL;
-ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS proctored          BOOLEAN     NOT NULL DEFAULT FALSE;
-ALTER TABLE app.contests ADD COLUMN IF NOT EXISTS grade_visibility   VARCHAR(20) NOT NULL DEFAULT 'private';
 
 CREATE INDEX IF NOT EXISTS idx_contests_group ON app.contests (group_id);
 
--- 24. Problems: problem type (standard vs subjective)
-ALTER TABLE app.problems ADD COLUMN IF NOT EXISTS problem_type VARCHAR(20) NOT NULL DEFAULT 'standard';
-
--- 24b. Problems: publish state (NULL = draft, not visible to students)
-ALTER TABLE app.problems ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ;
-
+-- 24. Problems: publish state index (NULL = draft, not visible to students)
 CREATE INDEX IF NOT EXISTS idx_problems_published_at ON app.problems (published_at);
-
--- 25. Contest problems: per-problem scoring mode (all_or_nothing vs partial)
-ALTER TABLE app.contest_problems ADD COLUMN IF NOT EXISTS scoring_mode VARCHAR(20) NOT NULL DEFAULT 'all_or_nothing';
-
--- 26. Submissions: manual grading / feedback / lock
-ALTER TABLE app.submissions ADD COLUMN IF NOT EXISTS manual_score INT;
-ALTER TABLE app.submissions ADD COLUMN IF NOT EXISTS feedback     TEXT        NOT NULL DEFAULT '';
-ALTER TABLE app.submissions ADD COLUMN IF NOT EXISTS graded_by    INT         REFERENCES app.users(id) ON DELETE SET NULL;
-ALTER TABLE app.submissions ADD COLUMN IF NOT EXISTS graded_at    TIMESTAMPTZ;
-ALTER TABLE app.submissions ADD COLUMN IF NOT EXISTS is_locked    BOOLEAN     NOT NULL DEFAULT FALSE;
 
 -- 27. Proctor events — monitoring log
 CREATE TABLE IF NOT EXISTS app.proctor_events (
