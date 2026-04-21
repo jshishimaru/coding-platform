@@ -237,12 +237,17 @@ CREATE TABLE IF NOT EXISTS app.problem_revisions (
 CREATE INDEX IF NOT EXISTS idx_problem_revisions_problem ON app.problem_revisions (problem_id);
 
 -- 12. Problem Generators — C++ test generators (testlib.h)
+--
+-- Like validators/checkers/interactors, at most one generator per problem is
+-- "active" at a time. The generate-tests endpoint uses the active generator
+-- unless the caller explicitly passes a generator_id.
 CREATE TABLE IF NOT EXISTS app.problem_generators (
     id          SERIAL PRIMARY KEY,
     problem_id  INT          NOT NULL REFERENCES app.problems(id) ON DELETE CASCADE,
     name        VARCHAR(100) NOT NULL,
     source_code TEXT         NOT NULL DEFAULT '',
     description TEXT         NOT NULL DEFAULT '',
+    is_active   BOOLEAN      NOT NULL DEFAULT FALSE,
     created_by  INT          NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
@@ -415,6 +420,11 @@ CREATE INDEX IF NOT EXISTS idx_contests_group ON app.contests (group_id);
 
 -- 24. Problems: problem type (standard vs subjective)
 ALTER TABLE app.problems ADD COLUMN IF NOT EXISTS problem_type VARCHAR(20) NOT NULL DEFAULT 'standard';
+
+-- 24b. Problems: publish state (NULL = draft, not visible to students)
+ALTER TABLE app.problems ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_problems_published_at ON app.problems (published_at);
 
 -- 25. Contest problems: per-problem scoring mode (all_or_nothing vs partial)
 ALTER TABLE app.contest_problems ADD COLUMN IF NOT EXISTS scoring_mode VARCHAR(20) NOT NULL DEFAULT 'all_or_nothing';
